@@ -199,17 +199,17 @@ class TestHandleServersModule(unittest.TestCase):
         self.comm.peer_connections = [(("127.0.0.1", 60001), self.dummy_socket)]
 
     def test_elect_leader(self):
-        self.comm.primary_node = None
-        self.comm.select_primary_node()
+        self.comm.leader = None
+        self.comm.select_leader()
         expected_leader = min(["127.0.0.1:60000", "127.0.0.1:60001"])
-        self.assertEqual(self.comm.primary_node, expected_leader)
+        self.assertEqual(self.comm.leader, expected_leader)
 
     def test_check_and_elect_leader(self):
         # Set leader to an invalid value so that check triggers a new election.
-        self.comm.primary_node = "invalid:port"
-        self.comm.verify_primary_node()
+        self.comm.leader = "invalid:port"
+        self.comm.verify_leader()
         expected_leader = min(["127.0.0.1:60000", "127.0.0.1:60001"])
-        self.assertEqual(self.comm.primary_node, expected_leader)
+        self.assertEqual(self.comm.leader, expected_leader)
 
     def test_distribute_update(self):
         update = {"command": "test_command", "data": {"key": "value"}}
@@ -220,8 +220,8 @@ class TestHandleServersModule(unittest.TestCase):
 
     def test_get_database_from_leader(self):
         # Set leader to the address of our dummy socket.
-        self.comm.primary_node = "127.0.0.1:60001"
-        self.comm.sync_database_from_primary()
+        self.comm.leader = "127.0.0.1:60001"
+        self.comm.sync_database_from_leader()
         sent_data = b"".join(self.dummy_socket.sent_data).decode("utf-8")
         self.assertIn("get_database", sent_data)
         self.assertIn("127.0.0.1", sent_data)

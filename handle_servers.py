@@ -23,7 +23,7 @@ class ServerCoordinator(threading.Thread):
         self.id = vm_id
         self.host = current_host
         self.port = current_port
-        self.primary_node = None  # store the current primary node
+        self.leader = None  # store the current leader
         self.db_synchronized = False
 
         # prepare connection endpoints
@@ -96,9 +96,9 @@ class ServerCoordinator(threading.Thread):
                             pass
                         elif msg["command"] == "internal_update":
                             if "leader" in msg["data"]:
-                                self.primary_node = msg["data"]["leader"]
+                                self.leader = msg["data"]["leader"]
                                 print(
-                                    f"INTERNAL {self.id}: Leader updated to {self.primary_node}"
+                                    f"INTERNAL {self.id}: Leader updated to {self.leader}"
                                 )
                         elif msg["command"] == "distribute_update":
                             command = msg["data"]["command"]
@@ -221,44 +221,44 @@ class ServerCoordinator(threading.Thread):
                             conn.close()
                             del self.peer_connections[ind]
 
-            # verify primary node status
-            self.verify_primary_node()
+            # verify leader status
+            self.verify_leader()
 
             # attempt to sync database if needed
             if not self.db_synchronized:
-                self.sync_database_from_primary()
+                self.sync_database_from_leader()
 
             time.sleep(1)
 
-    def verify_primary_node(self):
-        # check if current primary node is valid or needs re-election
+    def verify_leader(self):
+        # check if current leader is valid or needs re-election
         all_nodes = [f"{self.host}:{self.port}"] + [
             f"{addr[0]}:{addr[1]}" for addr, _ in self.peer_connections
         ]
         
         if (
-            not self.primary_node
-            or self.primary_node not in all_nodes
-            or self.primary_node < min(all_nodes)
+            not self.leader
+            or self.leader not in all_nodes
+            or self.leader < min(all_nodes)
         ):
-            print(f"INTERNAL {self.id}: Primary node validation failed, selecting new primary")
-            self.select_primary_node()
+            print(f"INTERNAL {self.id}: Leader validation failed, selecting new leader")
+            self.select_leader()
 
-    def select_primary_node(self):
-        # select a new primary node based on lowest ID
+    def select_leader(self):
+        # select a new leader based on lowest ID
         all_nodes = [f"{self.host}:{self.port}"] + [
             f"{addr[0]}:{addr[1]}" for addr, _ in self.peer_connections
         ]
-        new_primary = min(all_nodes)
-        self.primary_node = new_primary
+        new_leader = min(all_nodes)
+        self.leader = new_leader
         self.db_synchronized = False
-        print(f"INTERNAL {self.id}: New primary node selected: {self.primary_node}")
+        print(f"INTERNAL {self.id}: New leader selected: {self.leader}")
 
-    def sync_database_from_primary(self):
-        # request database sync from the current primary node
-        if self.primary_node is not None:
+    def sync_database_from_leader(self):
+        # request database sync from the current leader
+        if self.leader is not None:
             for addr, conn in self.peer_connections:
-                if f"{addr[0]}:{addr[1]}" == self.primary_node:
+                if f"{addr[0]}:{addr[1]}" == self.leader:
                     try:
                         conn.sendall(
                             f"{json.dumps({'version': 0, 'command': 'get_database', 'host': self.host, 'port': self.port})}\0".encode(
