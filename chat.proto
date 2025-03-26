@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package chat;
+
+// The Chat service definition
+service ChatService {
+  // User authentication and account management
+  rpc Login (LoginRequest) returns (LoginResponse) {}
+  rpc CreateAccount (CreateAccountRequest) returns (CreateAccountResponse) {}
+  rpc LogOff (LogOffRequest) returns (LogOffResponse) {}
+  rpc DeleteAccount (DeleteAccountRequest) returns (DeleteAccountResponse) {}
+  
+  // Messaging operations
+  rpc SendMessage (SendMessageRequest) returns (SendMessageResponse) {}
+  rpc ReadMessages (ReadMessagesRequest) returns (ReadMessagesResponse) {}
+  rpc DeleteMessages (DeleteMessagesRequest) returns (DeleteMessagesResponse) {}
+  rpc ViewConversation (ViewConversationRequest) returns (ViewConversationResponse) {}
+  
+  // User management
+  rpc ListAccounts (ListAccountsRequest) returns (ListAccountsResponse) {}
+  
+  // Message streaming for real-time updates
+  rpc SubscribeToMessages (SubscribeRequest) returns (stream ChatMessage) {}
+}
+
+// Login request message
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+// Login response message
+message LoginResponse {
+  bool success = 1;
+  string message = 2;
+  int32 unread_count = 3;
+}
+
+// Create account request message
+message CreateAccountRequest {
+  string username = 1;
+  string password = 2;
+}
+
+// Create account response message
+message CreateAccountResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// LogOff request message
+message LogOffRequest {
+  string username = 1;
+}
+
+// LogOff response message
+message LogOffResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Delete account request message
+message DeleteAccountRequest {
+  string username = 1;
+}
+
+// Delete account response message
+message DeleteAccountResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Send message request
+message SendMessageRequest {
+  string sender = 1;
+  string recipient = 2;
+  string content = 3;
+}
+
+// Send message response
+message SendMessageResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Read messages request
+message ReadMessagesRequest {
+  string username = 1;
+  int32 limit = 2;  // 0 means read all
+}
+
+// Read messages response
+message ReadMessagesResponse {
+  repeated ChatMessage messages = 1;
+}
+
+// Delete messages request
+message DeleteMessagesRequest {
+  string username = 1;
+  repeated int32 message_ids = 2;
+}
+
+// Delete messages response
+message DeleteMessagesResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// View conversation request
+message ViewConversationRequest {
+  string username = 1;
+  string other_user = 2;
+}
+
+// View conversation response
+message ViewConversationResponse {
+  repeated ChatMessage messages = 1;
+}
+
+// List accounts request
+message ListAccountsRequest {
+  string username = 1;
+  string wildcard = 2;
+}
+
+// List accounts response
+message ListAccountsResponse {
+  repeated string usernames = 1;
+}
+
+// Subscribe to messages request
+message SubscribeRequest {
+  string username = 1;
+}
+
+// Chat message definition
+message ChatMessage {
+  int32 id = 1;
+  string sender = 2;
+  string content = 3;
+  string timestamp = 4;
+}
