@@ -1,428 +1,455 @@
-import grpc
-import time
-import datetime
-import hashlib
+import database
 import fnmatch
-import threading
-import argparse
-import pickle
+import handle_servers
 import json
-import uuid
-from collections import OrderedDict
-from concurrent import futures
+import multiprocessing
+import selectors
+import socket
+import types
 
-# Import the generated gRPC code for chat and replication
-import chat_pb2
-import chat_pb2_grpc
-import replication_pb2
-import replication_pb2_grpc
-
-# -----------------------------
-# Chat Service with Persistence and Replication
-# -----------------------------
-class ChatServiceServicer(chat_pb2_grpc.ChatServiceServicer):
-    def __init__(self, replica_id, store_file, peer_addresses):
-        self.replica_id = replica_id
-        self.store_file = store_file
-        self.peer_addresses = peer_addresses  # list of peer addresses (host:port) for replication
-        # Load persistent state (or initialize if not present)
-        self.load_state()
-        # Maps usernames to their active subscription queues (for streaming)
-        self.active_subscriptions = {}
-
-    def load_state(self):
-        try:
-            with open(self.store_file, 'rb') as f:
-                state = pickle.load(f)
-                self.users = state.get('users', OrderedDict())
-                self.conversations = state.get('conversations', {})
-                self.next_msg_id = state.get('next_msg_id', 1)
-                self.processed_updates = state.get('processed_updates', set())
-            print(f"Loaded state from {self.store_file}")
-        except FileNotFoundError:
-            self.users = OrderedDict()
-            self.conversations = {}
-            self.next_msg_id = 1
-            self.processed_updates = set()
-            print(f"No existing state found. Starting fresh with {self.store_file}")
-
-    def save_state(self):
-        state = {
-            'users': self.users,
-            'conversations': self.conversations,
-            'next_msg_id': self.next_msg_id,
-            'processed_updates': self.processed_updates
+class FaultTolerantServer(multiprocessing.Process):
+    def __init__(self, id, host, port, current_starting_port=60000, 
+                 internal_other_servers=["localhost"], internal_other_ports=[60000], 
+                 internal_max_ports=[10]):
+        super().__init__()
+        # set id, host and port
+        self.id = f"{id}{port}"
+        self.host = host
+        self.port = port
+        # set up the internal communicator arguments
+        self.internal_communicator_args = {
+            "vm": self,
+            "vm_id": self.id,
+            "allowed_hosts": internal_other_servers,
+            "starting_ports": internal_other_ports,
+            "max_ports": internal_max_ports,
+            "current_host": host,
+            "current_port": current_starting_port,
         }
-        with open(self.store_file, 'wb') as f:
-            pickle.dump(state, f)
-
-    def replicate_update(self, update_id, update_type, data):
-        # Send replication update to all peers
-        for peer in self.peer_addresses:
-            try:
-                channel = grpc.insecure_channel(peer)
-                stub = replication_pb2_grpc.ReplicationServiceStub(channel)
-                request = replication_pb2.ReplicationUpdateRequest(
-                    update_id=update_id,
-                    update_type=update_type,
-                    data=data
-                )
-                response = stub.ReplicateUpdate(request)
-                if not response.success:
-                    print(f"Replication to {peer} failed: {response.message}")
-            except Exception as e:
-                print(f"Error replicating to {peer}: {e}")
-
-    def hash_password(self, password):
-        return hashlib.sha256(password.encode()).hexdigest()
-
-    def Login(self, request, context):
-        username = request.username
-        password = request.password
-
-        if username not in self.users:
-            return chat_pb2.LoginResponse(
-                success=False,
-                message="Username does not exist"
-            )
-
-        stored_hash = self.users[username]["password_hash"]
-        if stored_hash != self.hash_password(password):
-            return chat_pb2.LoginResponse(
-                success=False,
-                message="Incorrect password"
-            )
-
-        unread_count = len(self.users[username]["messages"])
-        return chat_pb2.LoginResponse(
-            success=True,
-            message=f"Login successful. Unread messages: {unread_count}",
-            unread_count=unread_count
-        )
-
-    def CreateAccount(self, request, context):
-        username = request.username
-        password = request.password
-
-        if username in self.users:
-            return chat_pb2.CreateAccountResponse(
-                success=False,
-                message="Username already exists"
-            )
-
-        self.users[username] = {
-            "password_hash": self.hash_password(password),
-            "messages": []
+        users, messages, settings = database.fetch_data_stores(self.id)
+        self.database = {
+            "users": users,
+            "messages": messages,
+            "settings": settings,
         }
-        self.save_state()
+        self.sel = None
 
-        # Replicate the update
-        update_id = str(uuid.uuid4())
-        update_data = json.dumps({
-            "username": username,
-            "password_hash": self.hash_password(password)
-        })
-        self.replicate_update(update_id, "create_account", update_data)
-
-        return chat_pb2.CreateAccountResponse(
-            success=True,
-            message="Account created"
-        )
-
-    def LogOff(self, request, context):
-        username = request.username
-        if username in self.active_subscriptions:
-            del self.active_subscriptions[username]
-        return chat_pb2.LogOffResponse(
-            success=True,
-            message="User logged off"
-        )
-
-    def DeleteAccount(self, request, context):
-        username = request.username
-
-        if username not in self.users:
-            return chat_pb2.DeleteAccountResponse(
-                success=False,
-                message="User does not exist"
-            )
-
-        del self.users[username]
-
-        # Remove active subscription if it exists
-        if username in self.active_subscriptions:
-            del self.active_subscriptions[username]
-
-        # Remove all conversation history involving this user
-        keys_to_delete = [key for key in self.conversations if username in key]
-        for key in keys_to_delete:
-            del self.conversations[key]
-
-        self.save_state()
-
-        update_id = str(uuid.uuid4())
-        update_data = json.dumps({
-            "username": username
-        })
-        self.replicate_update(update_id, "delete_account", update_data)
-
-        return chat_pb2.DeleteAccountResponse(
-            success=True,
-            message="Account and all conversation history deleted"
-        )
-
-    def SendMessage(self, request, context):
-        sender = request.sender
-        recipient = request.recipient
-        content = request.content
-        timestamp = datetime.datetime.now().isoformat()
-
-        if recipient not in self.users:
-            return chat_pb2.SendMessageResponse(
-                success=False,
-                message="Recipient not found"
-            )
-
-        msg_id = self.next_msg_id
-        self.next_msg_id += 1
-
-        message_entry = chat_pb2.ChatMessage(
-            id=msg_id,
-            sender=sender,
-            content=content,
-            timestamp=timestamp
-        )
-
-        conv_key = tuple(sorted([sender, recipient]))
-        if conv_key not in self.conversations:
-            self.conversations[conv_key] = []
-        self.conversations[conv_key].append(message_entry)
-
-        # If the recipient is not actively listening, add to their unread messages.
-        if recipient not in self.active_subscriptions:
-            self.users[recipient]["messages"].append(message_entry)
+    # extract json from data and return command, command data, data and data length
+    def extract_json(self, sock: socket.socket, data, internal_change=False):
+        if internal_change:
+            decoded_data = json.dumps(data)
         else:
+            decoded_data = data.outb.decode("utf-8").split("\0")[0]
+        json_data = json.loads(decoded_data)
+        version = json_data["version"]
+        command = json_data["command"]
+        command_data = json_data["data"]
+        data_length = len(decoded_data) + len("\0")
+        if version != 0:
+            self.emit_err(sock, data_length, data, "unsupported protocol version")
+        return command, command_data, data, data_length
+
+    # send a message back to the client with a json payload
+    def emit_msg(self, sock: socket.socket, data_length: int, command, data, message):
+        data_obj = {"version": 0, "command": command, "data": message}
+        sock.send(json.dumps(data_obj).encode("utf-8"))
+        data.outb = data.outb[data_length:]
+
+    # send an error message back to the client in json format
+    def emit_err(self, sock: socket.socket, data_length: int, data, error_message: str):
+        error_obj = {"version": 0, "command": "error", "data": {"error": error_message}}
+        sock.send(json.dumps(error_obj).encode("utf-8"))
+        data.outb = data.outb[data_length:]
+
+    # count the number of pending (undelivered) messages for a given username
+    def count_pending(self, username: str):
+        count = 0
+        for msg_obj in self.database["messages"]["undelivered"]:
+            if msg_obj["receiver"] == username:
+                count += 1
+        return count
+
+    # register a new user account
+    def register_user(self, sock: socket.socket, unparsed_data, internal_change=False):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data, internal_change)
+        username = cmd_data["username"].strip()
+        password = cmd_data["password"].strip()
+        if internal_change:
+            addr = cmd_data.get("addr")
+            self.database["users"][username] = {"password": password, "logged_in": True, "addr": addr}
+            database.persist_data_stores(self.id,
+                                         self.database["users"],
+                                         self.database["messages"],
+                                         self.database["settings"])
+            return
+        if not username.isalnum():
+            self.emit_err(sock, data_length, data, "username must be alphanumeric")
+            return
+        if username in self.database["users"]:
+            self.emit_err(sock, data_length, data, "username already exists")
+            return
+        if password.strip() == "":
+            self.emit_err(sock, data_length, data, "password cannot be empty")
+            return
+        # add new user to database
+        self.database["users"][username] = {
+            "password": password,
+            "logged_in": True,
+            "addr": f"{data.addr[0]}:{data.addr[1]}"
+        }
+        ret = {"username": username, "undeliv_messages": 0}
+        self.emit_msg(sock, data_length, "login", data, ret)
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "create",
+            "data": {
+                "username": username,
+                "password": password,
+                "addr": f"{data.addr[0]}:{data.addr[1]}"
+            }
+        })
+
+    # perform user login
+    def user_login(self, sock: socket.socket, unparsed_data, internal_change=False):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data, internal_change)
+        username = cmd_data["username"]
+        password = cmd_data.get("password")
+        if internal_change:
+            addr = cmd_data.get("addr")
+            self.database["users"][username]["logged_in"] = True
+            self.database["users"][username]["addr"] = addr
+            database.persist_data_stores(self.id,
+                                         self.database["users"],
+                                         self.database["messages"],
+                                         self.database["settings"])
+            return
+        if username not in self.database["users"]:
+            self.emit_err(sock, data_length, data, "username does not exist")
+            return
+        if self.database["users"][username]["logged_in"]:
+            self.emit_err(sock, data_length, data, "user already logged in")
+            return
+        if password != self.database["users"][username]["password"]:
+            self.emit_err(sock, data_length, data, "incorrect password")
+            return
+        pending = self.count_pending(username)
+        self.database["users"][username]["logged_in"] = True
+        self.database["users"][username]["addr"] = f"{data.addr[0]}:{data.addr[1]}"
+        ret = {"username": username, "undeliv_messages": pending}
+        self.emit_msg(sock, data_length, "login", data, ret)
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "login",
+            "data": {
+                "username": username,
+                "password": password,
+                "addr": f"{data.addr[0]}:{data.addr[1]}"
+            }
+        })
+
+    # perform user logout
+    def user_logout(self, sock: socket.socket, unparsed_data, internal_change=False):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data, internal_change)
+        username = cmd_data["username"]
+        if internal_change:
+            self.database["users"][username]["logged_in"] = False
+            self.database["users"][username]["addr"] = None
+            database.persist_data_stores(self.id,
+                                         self.database["users"],
+                                         self.database["messages"],
+                                         self.database["settings"])
+            return
+        if username not in self.database["users"]:
+            self.emit_err(sock, data_length, data, "username does not exist")
+            return
+        self.database["users"][username]["logged_in"] = False
+        self.database["users"][username]["addr"] = None
+        self.emit_msg(sock, data_length, "logout", data, {})
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "logout",
+            "data": {"username": username}
+        })
+
+    # perform search for users given a pattern
+    def find_users(self, sock: socket.socket, unparsed_data):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data)
+        pattern = cmd_data["search"]
+        matched = fnmatch.filter(self.database["users"].keys(), pattern)
+        ret = {"user_list": matched}
+        self.emit_msg(sock, data_length, "user_list", data, ret)
+
+    # remove a user account and its messages
+    def remove_account(self, sock: socket.socket, unparsed_data, internal_change=False):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data, internal_change)
+        acct = cmd_data["username"]
+        if internal_change:
+            if acct in self.database["users"]:
+                del self.database["users"][acct]
+                def rm_msgs(lst, acc):
+                    lst[:] = [m for m in lst if m["sender"] != acc and m["receiver"] != acc]
+                rm_msgs(self.database["messages"]["delivered"], acct)
+                rm_msgs(self.database["messages"]["undelivered"], acct)
+                database.persist_data_stores(self.id,
+                                             self.database["users"],
+                                             self.database["messages"],
+                                             self.database["settings"])
+            return
+        if acct not in self.database["users"]:
+            self.emit_err(sock, data_length, data, "account does not exist")
+            return
+        del self.database["users"][acct]
+        def rm_msgs(lst, acc):
+            lst[:] = [m for m in lst if m["sender"] != acc and m["receiver"] != acc]
+        rm_msgs(self.database["messages"]["delivered"], acct)
+        rm_msgs(self.database["messages"]["undelivered"], acct)
+        self.emit_msg(sock, data_length, "logout", data, {})
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "delete_acct",
+            "data": {"username": acct}
+        })
+
+    # process and deliver a message
+    def process_msg(self, sock: socket.socket, unparsed_data, internal_change=False):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data, internal_change)
+        sender = cmd_data["sender"]
+        receiver = cmd_data["recipient"]
+        message = cmd_data["message"]
+        if internal_change:
+            self.database["settings"]["counter"] += 1
+            msg_obj = {"id": self.database["settings"]["counter"],
+                       "sender": sender, "receiver": receiver, "message": message}
+            if self.database["users"][receiver]["logged_in"]:
+                self.database["messages"]["delivered"].append(msg_obj)
+            else:
+                self.database["messages"]["undelivered"].append(msg_obj)
+            database.persist_data_stores(self.id,
+                                         self.database["users"],
+                                         self.database["messages"],
+                                         self.database["settings"])
+            return
+        if receiver not in self.database["users"]:
+            self.emit_err(sock, data_length, data, "receiver does not exist")
+            return
+        self.database["settings"]["counter"] += 1
+        msg_obj = {"id": self.database["settings"]["counter"],
+                   "sender": sender, "receiver": receiver, "message": message}
+        if self.database["users"][receiver]["logged_in"]:
+            self.database["messages"]["delivered"].append(msg_obj)
+        else:
+            self.database["messages"]["undelivered"].append(msg_obj)
+        pending = self.count_pending(sender)
+        ret = {"undeliv_messages": pending}
+        self.emit_msg(sock, data_length, "refresh_home", data, ret)
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "send_msg",
+            "data": {"sender": sender, "recipient": receiver, "message": message}
+        })
+
+    # fetch undelivered messages for a user and move them to delivered
+    def fetch_pending_msgs(self, sock: socket.socket, unparsed_data):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data)
+        receiver = cmd_data["username"]
+        num_to_view = cmd_data["num_messages"]
+        delivered = self.database["messages"]["delivered"]
+        pending_list = self.database["messages"]["undelivered"]
+        to_send = []
+        remove_indices = []
+        if len(pending_list) == 0 and num_to_view > 0:
+            self.emit_err(sock, data_length, data, "no undelivered messages")
+            return
+        for idx, msg_obj in enumerate(pending_list):
+            if num_to_view == 0:
+                break
+            if msg_obj["receiver"] == receiver:
+                to_send.append({
+                    "id": msg_obj["id"],
+                    "sender": msg_obj["sender"],
+                    "message": msg_obj["message"]
+                })
+                delivered.append(msg_obj)
+                remove_indices.append(idx)
+                num_to_view -= 1
+        for idx in sorted(remove_indices, reverse=True):
+            del pending_list[idx]
+        ret = {"messages": to_send}
+        self.emit_msg(sock, data_length, "messages", data, ret)
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "get_undelivered",
+            "data": {"username": receiver, "num_messages": num_to_view}
+        })
+
+    # fetch delivered messages for a user
+    def fetch_seen_msgs(self, sock: socket.socket, unparsed_data):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data)
+        receiver = cmd_data["username"]
+        num_to_view = cmd_data["num_messages"]
+        delivered = self.database["messages"]["delivered"]
+        if len(delivered) == 0 and num_to_view > 0:
+            self.emit_err(sock, data_length, data, "no delivered messages")
+            return
+        to_send = []
+        for msg_obj in delivered:
+            if num_to_view == 0:
+                break
+            if msg_obj["receiver"] == receiver:
+                to_send.append({
+                    "id": msg_obj["id"],
+                    "sender": msg_obj["sender"],
+                    "message": msg_obj["message"]
+                })
+                num_to_view -= 1
+        ret = {"messages": to_send}
+        self.emit_msg(sock, data_length, "messages", data, ret)
+
+    # update home with new undelivered message count
+    def update_home(self, sock: socket.socket, unparsed_data):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data)
+        username = cmd_data["username"]
+        pending = self.count_pending(username)
+        ret = {"undeliv_messages": pending}
+        self.emit_msg(sock, data_length, "refresh_home", data, ret)
+
+    # remove messages given by delete ids
+    def remove_msgs(self, sock: socket.socket, unparsed_data, internal_change=False):
+        _, cmd_data, data, data_length = self.extract_json(sock, unparsed_data, internal_change)
+        current_user = cmd_data["current_user"]
+        ids_to_rm = set(cmd_data["delete_ids"].split(","))
+        if internal_change:
+            self.database["messages"]["delivered"] = [
+                m for m in self.database["messages"]["delivered"]
+                if not (str(m["id"]) in ids_to_rm and m["receiver"] == current_user)
+            ]
+            database.persist_data_stores(self.id,
+                                         self.database["users"],
+                                         self.database["messages"],
+                                         self.database["settings"])
+            return
+        self.database["messages"]["delivered"] = [
+            m for m in self.database["messages"]["delivered"]
+            if not (str(m["id"]) in ids_to_rm and m["receiver"] == current_user)
+        ]
+        pending = self.count_pending(current_user)
+        ret = {"undeliv_messages": pending}
+        self.emit_msg(sock, data_length, "refresh_home", data, ret)
+        database.persist_data_stores(self.id,
+                                     self.database["users"],
+                                     self.database["messages"],
+                                     self.database["settings"])
+        self.internal_communicator.broadcast_update({
+            "command": "delete_msg",
+            "data": {"current_user": current_user, "delete_ids": ",".join(list(ids_to_rm))}
+        })
+
+    # accept a new connection and register it with the selector
+    def accept_conn(self, sock):
+        conn, addr = sock.accept()
+        print(f"accepted connection from {addr}")
+        conn.setblocking(False)
+        data = types.SimpleNamespace(addr=addr, inb=b"", outb=b"")
+        events = selectors.EVENT_READ | selectors.EVENT_WRITE
+        self.sel.register(conn, events, data=data)
+
+    # serve existing connection events
+    def handle_conn(self, key, mask):
+        sock = key.fileobj
+        data = key.data
+        if mask & selectors.EVENT_READ:
             try:
-                self.active_subscriptions[recipient].put(message_entry)
-            except Exception as e:
-                print(f"Error forwarding message to {recipient}: {e}")
-                self.users[recipient]["messages"].append(message_entry)
+                recv_data = sock.recv(1024)
+            except ConnectionResetError:
+                recv_data = None
+            if recv_data:
+                data.outb += recv_data
+            else:
+                print(f"closing connection to {data.addr}")
+                self.sel.unregister(sock)
+                sock.close()
+                for user in self.database["users"]:
+                    if self.database["users"][user]["addr"] == f"{data.addr[0]}:{data.addr[1]}":
+                        self.database["users"][user]["logged_in"] = False
+                        self.database["users"][user]["addr"] = None
+                        self.internal_communicator.broadcast_update({
+                            "command": "logout",
+                            "data": {"username": user}
+                        })
+                        break
+                database.persist_data_stores(self.id,
+                                             self.database["users"],
+                                             self.database["messages"],
+                                             self.database["settings"])
+        if mask & selectors.EVENT_WRITE:
+            if data.outb:
+                received_data = data.outb.decode("utf-8")
+                command, _, _, data_length = self.extract_json(sock, data)
+                if command == "create":
+                    self.register_user(sock, data)
+                elif command == "login":
+                    self.user_login(sock, data)
+                elif command == "logout":
+                    self.user_logout(sock, data)
+                elif command == "search":
+                    self.find_users(sock, data)
+                elif command == "delete_acct":
+                    self.remove_account(sock, data)
+                elif command == "send_msg":
+                    self.process_msg(sock, data)
+                elif command == "get_undelivered":
+                    self.fetch_pending_msgs(sock, data)
+                elif command == "get_delivered":
+                    self.fetch_seen_msgs(sock, data)
+                elif command == "refresh_home":
+                    self.update_home(sock, data)
+                elif command == "delete_msg":
+                    self.remove_msgs(sock, data)
+                elif command == "check_connection":
+                    data.outb = data.outb[data_length:]
+                else:
+                    print(f"no valid command: {received_data}")
+                    data.outb = data.outb[len(received_data):]
 
-        self.save_state()
-
-        update_id = str(uuid.uuid4())
-        update_data = json.dumps({
-            "sender": sender,
-            "recipient": recipient,
-            "content": content,
-            "msg_id": msg_id,
-            "timestamp": timestamp
-        })
-        self.replicate_update(update_id, "send_message", update_data)
-
-        return chat_pb2.SendMessageResponse(
-            success=True,
-            message="Message sent"
-        )
-
-    def ReadMessages(self, request, context):
-        username = request.username
-        limit = request.limit
-
-        if username not in self.users:
-            return chat_pb2.ReadMessagesResponse()
-
-        user_messages = self.users[username]["messages"]
-
-        if limit > 0:
-            messages_to_view = user_messages[:limit]
-            self.users[username]["messages"] = user_messages[limit:]
-        else:
-            messages_to_view = user_messages
-            self.users[username]["messages"] = []
-
-        self.save_state()
-        return chat_pb2.ReadMessagesResponse(messages=messages_to_view)
-
-    def DeleteMessages(self, request, context):
-        username = request.username
-        message_ids = request.message_ids
-
-        if username not in self.users:
-            return chat_pb2.DeleteMessagesResponse(
-                success=False,
-                message="User not found"
-            )
-
-        if not message_ids:
-            return chat_pb2.DeleteMessagesResponse(
-                success=False,
-                message="No message IDs provided"
-            )
-
-        # Delete from unread messages
-        current_unread = self.users[username]["messages"]
-        self.users[username]["messages"] = [msg for msg in current_unread if msg.id not in message_ids]
-
-        # Delete from conversation history
-        for conv_key in self.conversations:
-            if username in conv_key:
-                conv = self.conversations[conv_key]
-                self.conversations[conv_key] = [msg for msg in conv if msg.id not in message_ids]
-
-        self.save_state()
-
-        update_id = str(uuid.uuid4())
-        update_data = json.dumps({
-            "username": username,
-            "message_ids": message_ids
-        })
-        self.replicate_update(update_id, "delete_messages", update_data)
-
-        return chat_pb2.DeleteMessagesResponse(
-            success=True,
-            message="Specified messages deleted"
-        )
-
-    def ViewConversation(self, request, context):
-        username = request.username
-        other_user = request.other_user
-
-        if other_user not in self.users:
-            return chat_pb2.ViewConversationResponse()
-
-        conv_key = tuple(sorted([username, other_user]))
-        conversation = self.conversations.get(conv_key, [])
-
-        # Mark unread messages from the other user as read
-        if username in self.users:
-            current_unread = self.users[username]["messages"]
-            self.users[username]["messages"] = [msg for msg in current_unread if msg.sender != other_user]
-            self.save_state()
-
-        return chat_pb2.ViewConversationResponse(messages=conversation)
-
-    def ListAccounts(self, request, context):
-        username = request.username
-        wildcard = request.wildcard if request.wildcard else "*"
-        matching_users = fnmatch.filter(list(self.users.keys()), wildcard)
-        return chat_pb2.ListAccountsResponse(usernames=matching_users)
-
-    def SubscribeToMessages(self, request, context):
-        username = request.username
-        import queue
-        message_queue = queue.Queue()
-        self.active_subscriptions[username] = message_queue
-
+    # run the server: setup the internal communicator and socket listening
+    def run(self):
+        self.sel = selectors.DefaultSelector()
+        self.internal_communicator = handle_servers.ServerCoordinator(**self.internal_communicator_args)
+        self.internal_communicator.start()
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lsock.bind((self.host, self.port))
+        lsock.listen()
+        print("listening on", (self.host, self.port))
+        lsock.setblocking(False)
+        self.sel.register(lsock, selectors.EVENT_READ, data=None)
         try:
-            while context.is_active():
-                try:
-                    msg = message_queue.get(timeout=1.0)
-                    yield msg
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"Error in subscription for {username}: {e}")
+            while True:
+                events = self.sel.select(timeout=None)
+                for key, mask in events:
+                    if key.data is None:
+                        self.accept_conn(key.fileobj)
+                    else:
+                        self.handle_conn(key, mask)
+        except KeyboardInterrupt:
+            print(f"{self.id} : caught keyboard interrupt, exiting")
         finally:
-            if username in self.active_subscriptions:
-                del self.active_subscriptions[username]
-
-# -----------------------------
-# Replication Service for Inter-Replica Updates
-# -----------------------------
-class ReplicationServiceServicer(replication_pb2_grpc.ReplicationServiceServicer):
-    def __init__(self, primary_service: ChatServiceServicer):
-        self.primary_service = primary_service
-
-    def ReplicateUpdate(self, request, context):
-        update_id = request.update_id
-        # Check if this update has already been applied
-        if update_id in self.primary_service.processed_updates:
-            return replication_pb2.ReplicationUpdateResponse(success=True, message="Already processed")
-
-        try:
-            data = json.loads(request.data)
-            update_type = request.update_type
-
-            if update_type == "create_account":
-                username = data["username"]
-                if username not in self.primary_service.users:
-                    self.primary_service.users[username] = {
-                        "password_hash": data["password_hash"],
-                        "messages": []
-                    }
-            elif update_type == "send_message":
-                sender = data["sender"]
-                recipient = data["recipient"]
-                msg_id = data["msg_id"]
-                timestamp = data["timestamp"]
-                content = data["content"]
-                message_entry = chat_pb2.ChatMessage(
-                    id=msg_id,
-                    sender=sender,
-                    content=content,
-                    timestamp=timestamp
-                )
-                conv_key = tuple(sorted([sender, recipient]))
-                if conv_key not in self.primary_service.conversations:
-                    self.primary_service.conversations[conv_key] = []
-                # Avoid duplicates
-                if not any(m.id == msg_id for m in self.primary_service.conversations[conv_key]):
-                    self.primary_service.conversations[conv_key].append(message_entry)
-                if recipient in self.primary_service.users:
-                    if not any(m.id == msg_id for m in self.primary_service.users[recipient]["messages"]):
-                        self.primary_service.users[recipient]["messages"].append(message_entry)
-            elif update_type == "delete_account":
-                username = data["username"]
-                if username in self.primary_service.users:
-                    del self.primary_service.users[username]
-                keys_to_delete = [key for key in self.primary_service.conversations if username in key]
-                for key in keys_to_delete:
-                    del self.primary_service.conversations[key]
-            elif update_type == "delete_messages":
-                username = data["username"]
-                message_ids = data["message_ids"]
-                if username in self.primary_service.users:
-                    current_unread = self.primary_service.users[username]["messages"]
-                    self.primary_service.users[username]["messages"] = [msg for msg in current_unservice.users[username]["messages"] if msg.id not in message_ids] if False else [
-                        msg for msg in self.primary_service.users[username]["messages"] if msg.id not in message_ids
-                    ]
-                for conv_key in self.primary_service.conversations:
-                    if username in conv_key:
-                        conv = self.primary_service.conversations[conv_key]
-                        self.primary_service.conversations[conv_key] = [msg for msg in conv if msg.id not in message_ids]
-            # Mark the update as processed
-            self.primary_service.processed_updates.add(update_id)
-            self.primary_service.save_state()
-            return replication_pb2.ReplicationUpdateResponse(success=True, message="Update applied")
-        except Exception as e:
-            return replication_pb2.ReplicationUpdateResponse(success=False, message=str(e))
-
-# -----------------------------
-# Main Server Runner
-# -----------------------------
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--replica_id", required=True, help="Unique ID for this replica")
-    parser.add_argument("--port", default="50051", help="Port to serve chat service on")
-    parser.add_argument("--peer_addresses", nargs="*", default=[], help="List of peer addresses (host:port) for replication")
-    args = parser.parse_args()
-
-    store_file = f"state_{args.replica_id}.pkl"
-    chat_servicer = ChatServiceServicer(replica_id=args.replica_id,
-                                          store_file=store_file,
-                                          peer_addresses=args.peer_addresses)
-    replication_servicer = ReplicationServiceServicer(chat_servicer)
-
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    chat_pb2_grpc.add_ChatServiceServicer_to_server(chat_servicer, server)
-    replication_pb2_grpc.add_ReplicationServiceServicer_to_server(replication_servicer, server)
-    server.add_insecure_port(f'[::]:{args.port}')
-    server.start()
-    print(f"Replica {args.replica_id} started on port {args.port}")
-    try:
-        while True:
-            time.sleep(86400)  # one day
-    except KeyboardInterrupt:
-        server.stop(0)
-        print("Server stopped")
+            self.sel.close()
